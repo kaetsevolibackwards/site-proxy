@@ -1,24 +1,136 @@
 <!-- name=public/index.html -->
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>Site Proxy</title></head>
+  <head>
+    <meta charset="utf-8">
+    <title>Site Proxy + Puppeteer</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Arial; padding: 12px; }
+      #controls { margin-bottom: 8px; }
+      #canvas { border: 1px solid #ccc; display:block; }
+    </style>
+  </head>
   <body>
     <h3>Site Proxy (development)</h3>
-    <form id="f">
-      <input id="url" placeholder="https://example.com" size="60" />
-      <button type="submit">Load</button>
-    </form>
-    <div style="margin-top:10px">
-      <iframe id="frame" style="width:100%;height:80vh;border:1px solid #ccc"></iframe>
+
+    <div id="controls">
+      <input id="url" placeholder="https://example.com or https://youtube.com" size="60" />
+      <button id="loadProxy">Load via HTTP proxy</button>
+      <button id="startSession">Start Puppeteer session</button>
+      <button id="stopSession" disabled>Stop Session</button>
+    </div>
+
+    <div>
+      <iframe id="frame" style="width:100%;height:60vh;border:1px solid #ccc"></iframe>
+    </div>
+
+    <div style="margin-top:12px">
+      <canvas id="canvas" width="1280" height="720" style="max-width:100%"></canvas>
     </div>
 
     <script>
-      document.getElementById('f').addEventListener('submit', (e) => {
-        e.preventDefault();
-        const u = document.getElementById('url').value.trim();
+      const loadProxyBtn = document.getElementById('loadProxy');
+      const startBtn = document.getElementById('startSession');
+      const stopBtn = document.getElementById('stopSession');
+      const urlInput = document.getElementById('url');
+      const frame = document.getElementById('frame');
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+
+      loadProxyBtn.addEventListener('click', () => {
+        const u = urlInput.value.trim();
         if (!u) return;
-        document.getElementById('frame').src = '/proxy?url=' + encodeURIComponent(u);
+        frame.src = '/proxy?url=' + encodeURIComponent(u);
       });
+
+      let ws = null;
+      let sessionId = null;
+
+      startBtn.addEventListener('click', async () => {
+        const url = urlInput.value.trim();
+        if (!url) return alert('Enter a URL');
+        // create a session
+        const resp = await fetch('/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+        const j = await resp.json();
+        if (j.error) return alert('Failed: ' + j.error);
+        sessionId = j.sessionId;
+        startWS(sessionId);
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      });
+
+      stopBtn.addEventListener('click', () => {
+        if (ws) ws.close();
+        ws = null;
+        sessionId = null;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      });
+
+      function startWS(id) {
+        const loc = window.location;
+        const protocol = loc.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(protocol + '://' + loc.host + '/ws?sessionId=' + encodeURIComponent(id));
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => console.log('ws open');
+        ws.onmessage = (ev) => {
+          if (typeof ev.data === 'string') {
+            try { const msg = JSON.parse(ev.data); console.log('ws msg', msg); } catch(e){}
+            return;
+          }
+          // binary frame: jpeg image
+          const blob = new Blob([ev.data], { type: 'image/jpeg' });
+          const img = new Image();
+          img.onload = () => {
+            // resize canvas if needed
+            if (canvas.width !== img.width || canvas.height !== img.height) {
+              canvas.width = img.width; canvas.height = img.height;
+            }
+            ctx.drawImage(img, 0, 0);
+            URL.revokeObjectURL(img.src);
+          };
+          img.src = URL.createObjectURL(blob);
+        };
+        ws.onclose = () => console.log('ws closed');
+
+        // forward mouse events
+        canvas.addEventListener('mousemove', (e) => {
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+          const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+          ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'mouse', action: 'move', x, y }));
+        });
+        canvas.addEventListener('mousedown', (e) => {
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+          const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+          ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'mouse', action: 'down', x, y }));
+        });
+        canvas.addEventListener('mouseup', (e) => {
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+          const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+          ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'mouse', action: 'up', x, y }));
+        });
+        canvas.addEventListener('click', (e) => {
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+          const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+          ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'mouse', action: 'click', x, y }));
+        });
+        canvas.addEventListener('wheel', (e) => {
+          ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY }));
+        });
+        window.addEventListener('keydown', (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          // send key presses
+          if (e.key.length === 1) {
+            ws.send(JSON.stringify({ type: 'keyboard', action: 'type', text: e.key }));
+          } else {
+            ws.send(JSON.stringify({ type: 'keyboard', action: 'press', key: e.key }));
+          }
+        });
+      }
     </script>
   </body>
 </html>
