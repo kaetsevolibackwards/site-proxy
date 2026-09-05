@@ -248,17 +248,47 @@ module.exports = class {
                         break;
                 };
 
+                // Header processing and safe rewrites
                 Object.entries(proxyResponse.headers).forEach(([header_name, header_value]) => {
-                    if (header_name == 'set-cookie') {
+
+                    const name = String(header_name).toLowerCase();
+
+                    // Rewrite Set-Cookie to remove Domain and ensure Path=/ so cookies apply to the proxy host
+                    if (name === 'set-cookie') {
                         const cookie_array = [];
-                        header_value.forEach(cookie => cookie_array.push(cookie.replace(/Domain=(.*?);/gi, `Domain=` + req.headers['host'] + ';').replace(/(.*?)=(.*?);/, '$1' + '@' + proxyURL.hostname + '=$2;')));
+                        const arr = Array.isArray(header_value) ? header_value : [header_value];
+                        arr.forEach(cookie => {
+                            // remove Domain attribute so the cookie defaults to proxy host
+                            let c = cookie.replace(/;?\s*Domain=[^;]+/i, '');
+                            // ensure Path=/ exists
+                            if (!/;\s*path=/i.test(c)) c = c + '; Path=/';
+                            cookie_array.push(c);
+                        });
                         proxyResponse.headers[header_name] = cookie_array;
+                        return;
+                    }
 
-                    };
+                    // Force rewrite Location headers to proxied /prox?url=BASE64(...) so redirects stay on the proxy
+                    if (name === 'location') {
+                        try {
+                            let absolute = header_value;
+                            try { new URL(absolute); } catch (_) { absolute = new URL(header_value, proxyURL.href).toString(); }
+                            const encoded = Buffer.from(absolute).toString('base64');
+                            const proxied = `/prox?url=${encoded}`;
+                            proxyResponse.headers[header_name] = proxied;
+                            console.log('tProxy: rewrote Location ->', proxied);
+                        } catch (e) {
+                            proxyResponse.headers[header_name] = header_value;
+                        }
+                        return;
+                    }
 
-                    if (header_name.startsWith('content-encoding') || header_name.startsWith('x-') || header_name.startsWith('cf-') || header_name.startsWith('strict-transport-security') || header_name.startsWith('access-control-')) delete proxyResponse.headers[header_name];
+                    // Drop hop-by-hop and sensitive headers we don't want to forward
+                    if (name.startsWith('content-encoding') || name.startsWith('x-') || name.startsWith('cf-') || name.startsWith('strict-transport-security') || name.startsWith('access-control-')) {
+                        delete proxyResponse.headers[header_name];
+                        return;
+                    }
 
-                    if (header_name == 'location') proxyResponse.headers[header_name] = proxify.url(header_value);
                 });
 
                 if (proxyResponse.headers['content-type'] && proxyResponse.headers['content-type'].startsWith('text/html')) sendData = proxify.html(sendData.toString());
