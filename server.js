@@ -1,5 +1,5 @@
 // name=server.js
-// Minimal site proxy with improved HTML rewriting
+// Site proxy with streaming, header forwarding, and improved client-side fixes for service workers and XHR
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -10,15 +10,12 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.static('public'));
 
-// Helper: build proxied URL for an absolute target
 function proxiedUrlFor(target) {
   return '/proxy?url=' + encodeURIComponent(target);
 }
 
-// Normalize protocol-relative and relative URLs to absolute using target origin
 function resolveUrl(attrValue, baseUrl) {
   if (!attrValue) return null;
-  // protocol-relative //example.com/foo
   if (attrValue.startsWith('//')) {
     return baseUrl.protocol + attrValue;
   }
@@ -28,6 +25,17 @@ function resolveUrl(attrValue, baseUrl) {
     return null;
   }
 }
+
+// headers from incoming request that we'll forward when requesting upstream
+const FORWARD_REQ_HEADERS = [
+  'accept', 'accept-language', 'user-agent', 'referer', 'range', 'cookie', 'origin', 'authorization',
+  'sec-fetch-mode','sec-fetch-site','sec-fetch-dest'
+];
+
+// hop-by-hop headers we should not forward from upstream to client
+const HOP_BY_HOP = new Set([
+  'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailers','transfer-encoding','upgrade'
+]);
 
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
@@ -40,27 +48,38 @@ app.get('/proxy', async (req, res) => {
     return res.status(400).send('Invalid URL');
   }
 
+  // Build upstream request headers by copying selected client headers
+  const upstreamHeaders = {};
+  FORWARD_REQ_HEADERS.forEach(h => {
+    if (req.headers[h]) upstreamHeaders[h] = req.headers[h];
+  });
+
+  // Do not forward host header; axios will set it correctly
+
   try {
-    const response = await axios.get(target, {
-      responseType: 'arraybuffer',
+    // Use stream so we can pipe non-HTML content and honor Range requests
+    const upstream = await axios.get(target, {
+      responseType: 'stream',
       validateStatus: null,
-      headers: { 'User-Agent': 'site-proxy/0.1' }
+      headers: upstreamHeaders,
+      maxRedirects: 5
     });
 
-    const contentType = (response.headers['content-type'] || '').toLowerCase();
+    const upstreamContentType = (upstream.headers['content-type'] || '').toLowerCase();
 
-    // Set permissive headers for embedding
-    res.setHeader('content-type', contentType || 'application/octet-stream');
-    res.setHeader('x-frame-options', 'ALLOWALL');
-    res.setHeader('content-security-policy', "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;");
+    // For HTML we need to consume the stream and rewrite
+    if (upstreamContentType.includes('text/html')) {
+      const chunks = [];
+      await new Promise((resolve, reject) => {
+        upstream.data.on('data', c => chunks.push(c));
+        upstream.data.on('end', resolve);
+        upstream.data.on('error', reject);
+      });
+      const html = Buffer.concat(chunks).toString('utf8');
 
-    if (contentType.includes('text/html')) {
-      const html = response.data.toString('utf8');
       const $ = cheerio.load(html, { decodeEntities: false });
-
       const base = targetUrl;
 
-      // Elements/attributes to rewrite
       const ATTRS = [
         { sel: 'img', attr: 'src' },
         { sel: 'script', attr: 'src' },
@@ -83,7 +102,7 @@ app.get('/proxy', async (req, res) => {
         });
       });
 
-      // srcset handling (images)
+      // srcset
       $('[srcset]').each((i, el) => {
         const raw = $(el).attr('srcset');
         const parts = raw.split(',').map(p => p.trim()).map(item => {
@@ -95,7 +114,7 @@ app.get('/proxy', async (req, res) => {
         $(el).attr('srcset', parts.join(', '));
       });
 
-      // rewrite <meta http-equiv="refresh" content="X; url=...">
+      // meta refresh
       $('meta[http-equiv]').each((i, el) => {
         const he = ($(el).attr('http-equiv') || '').toLowerCase();
         if (he === 'refresh') {
@@ -110,23 +129,54 @@ app.get('/proxy', async (req, res) => {
         }
       });
 
-      // Remove <base> so our rewrites are authoritative
+      // remove base
       $('base').remove();
 
-      // Inject a small client-side script to proxy fetch/XHR calls to keep XHR working for relative requests
-      const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  // Override fetch\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input);\n    return _fetch.call(this, input, init);\n  };\n  // Override XHR open\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n})();\n</script>\n      `;
+      // Improved injected script: force navigator.onLine true, noop serviceWorker.register, and proxy fetch/XHR
+      const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  // Override fetch\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    try{ if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input); } catch(e){}\n    return _fetch.call(this, input, init);\n  };\n  // Override XHR open\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n  // No-op serviceWorker registration to avoid worker-related offline states\n  if (navigator && navigator.serviceWorker) {\n    navigator.serviceWorker.register = function(){ return Promise.resolve(); };\n  }\n  // Force navigator.onLine to true\n  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}\n})();\n</script>\n      `;
 
-      // inject script before </body>
       $('body').append(injectedScript);
 
-      // Send modified HTML
+      // Copy selected response headers from upstream but filter hop-by-hop and overwrite CSP/frame headers
+      const respHeaders = Object.assign({}, upstream.headers);
+      // Remove hop-by-hop
+      Object.keys(respHeaders).forEach(h => {
+        if (HOP_BY_HOP.has(h.toLowerCase())) delete respHeaders[h];
+      });
+      // Overwrite or remove blocking headers
+      respHeaders['x-frame-options'] = 'ALLOWALL';
+      respHeaders['content-security-policy'] = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;";
+      // Do not forward content-length; let express set chunked encoding
+      delete respHeaders['content-length'];
+
+      // Set status and headers
+      res.status(upstream.status);
+      Object.entries(respHeaders).forEach(([k, v]) => {
+        try { res.setHeader(k, v); } catch(e){}
+      });
+
       return res.send($.html());
     }
 
-    // Non-HTML: send raw bytes
-    res.send(Buffer.from(response.data, 'binary'));
+    // Non-HTML: stream back to client, preserving status and many headers (for Range support)
+    // Copy headers
+    const toCopy = ['content-type','content-length','content-range','accept-ranges','cache-control','expires','last-modified','etag','set-cookie'];
+    toCopy.forEach(h => {
+      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
+    });
+
+    // Overwrite CSP/frame headers
+    res.setHeader('x-frame-options', 'ALLOWALL');
+    res.setHeader('content-security-policy', "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;");
+
+    // Set upstream status
+    res.status(upstream.status);
+
+    // Pipe stream
+    upstream.data.pipe(res);
+
   } catch (err) {
-    console.error('proxy error', err && err.message);
+    console.error('proxy error', err && (err.message || err.toString()));
     res.status(502).send('Error fetching target URL');
   }
 });
