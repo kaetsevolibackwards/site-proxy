@@ -1,35 +1,21 @@
-# site-proxy (lightweight)
+# site-proxy (http-proxy)
 
-A lightweight development site proxy for viewing and interacting with other sites via localhost. This version removes Puppeteer and streaming; it focuses on being small and easy to run.
+This version uses http-proxy for efficient streaming and cheerio to rewrite HTML responses when small enough to buffer.
 
-Features
-- Server-side proxy at `/proxy?url=<target>`
-- Streams non-HTML assets and preserves Range headers (helpful for video/audio)
-- Parses HTML and rewrites resource links (src, href, srcset, form action, meta refresh) so resources load through the proxy
-- Injects a small client helper to proxy fetch/XHR and noop serviceWorker registrations
-- Optional host whitelist via `ALLOWED_HOSTS` and optional Basic Auth via `BASIC_AUTH_USER` / `BASIC_AUTH_PASS`
-
-Quick start
-1. Clone or update your local copy:
-   git clone https://github.com/kaetsevolibackwards/site-proxy.git
-   cd site-proxy
-
-2. Install and run:
-   npm install
-   npm start
-
-3. Open http://localhost:3000 and enter a URL (e.g. https://example.com)
+Why this design?
+- http-proxy handles streaming with proper backpressure and low memory usage for binary assets (video, images, large downloads).
+- HTML pages are typically small enough to buffer (configurable limit) and can be reliably rewritten with cheerio.
+- If an HTML response is larger than the buffer limit, the proxy falls back to streaming the upstream response directly (best-effort) to avoid consuming too much memory.
 
 Environment variables
-- ALLOWED_HOSTS (optional): comma-separated hostnames to allow through the proxy (development default: allow all)
-  Example: ALLOWED_HOSTS=example.com,static.example.com
+- MAX_HTML_BYTES (default 2MB) — maximum HTML size to buffer and rewrite. Larger pages will be streamed raw.
+- ALLOWED_HOSTS — comma-separated whitelist of hostnames to allow through the proxy. Empty means allow all.
+- BASIC_AUTH_USER / BASIC_AUTH_PASS — enable basic auth to protect the proxy.
 
-- BASIC_AUTH_USER and BASIC_AUTH_PASS (optional): enable Basic Auth for the entire site
-  Example (Linux/macOS): BASIC_AUTH_USER=alice BASIC_AUTH_PASS=secret npm start
-  On Windows PowerShell: $env:BASIC_AUTH_USER='alice'; $env:BASIC_AUTH_PASS='secret'; npm start
+Run
+- npm install
+- npm start
+- Open http://localhost:3000 and enter a URL
 
 Security
-- This proxy is intended for local development only. Do not expose it to the public internet without strong authentication and host whitelisting.
-- Some sites (Google/YouTube, DRM, reCAPTCHA) still will not function correctly through a proxy due to origin checks or anti-bot protections. For those, consider using official embed APIs or a remote browser approach.
-
-If you want me to add a small Basic Auth UI, stricter host whitelist behavior, or package this for easy deployment (Docker/Render), tell me which and I'll prepare it.
+- This is a development proxy. Do not expose publicly without basic auth and host whitelisting.
