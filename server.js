@@ -1,23 +1,41 @@
 // name=server.js
-// Site proxy with Puppeteer interactive sessions and improved proxy behavior
+// Lightweight site proxy (no Puppeteer). Focuses on streaming assets, HTML rewriting, and simple protections.
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { URL } = require('url');
-const http = require('http');
-const WebSocket = require('ws');
-const puppeteer = require('puppeteer');
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
-
 const PORT = process.env.PORT || 3000;
 
 app.use(express.static('public'));
-app.use(express.json());
 
-// --- Existing proxy helpers ---
+// Optional basic auth middleware if BASIC_AUTH_USER and BASIC_AUTH_PASS are set
+function basicAuth(req, res, next) {
+  const user = process.env.BASIC_AUTH_USER;
+  const pass = process.env.BASIC_AUTH_PASS;
+  if (!user || !pass) return next();
+  const auth = req.headers.authorization || '';
+  const match = auth.match(/^Basic\s+(.*)$/i);
+  if (!match) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="site-proxy"');
+    return res.status(401).send('Authentication required');
+  }
+  const creds = Buffer.from(match[1], 'base64').toString('utf8').split(':');
+  if (creds[0] === user && creds[1] === pass) return next();
+  res.setHeader('WWW-Authenticate', 'Basic realm="site-proxy"');
+  return res.status(401).send('Authentication required');
+}
+
+app.use(basicAuth);
+
+// Allowed hosts optional: comma-separated hostnames in ALLOWED_HOSTS
+function isHostAllowed(hostname) {
+  const list = (process.env.ALLOWED_HOSTS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (list.length === 0) return true; // no whitelist means allow all (development default)
+  return list.includes(hostname);
+}
+
 function proxiedUrlFor(target) {
   return '/proxy?url=' + encodeURIComponent(target);
 }
@@ -42,133 +60,6 @@ const HOP_BY_HOP = new Set([
   'connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailers','transfer-encoding','upgrade'
 ]);
 
-// --- Puppeteer session manager ---
-const sessions = new Map(); // sessionId -> {page, interval, lastActive, ws, fps}
-let browserPromise = null;
-async function getBrowser() {
-  if (!browserPromise) browserPromise = puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
-  return browserPromise;
-}
-
-function makeId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
-}
-
-// Helper to clamp fps and quality
-function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
-const DEFAULT_FPS = parseInt(process.env.PUPPETEER_FPS) || 12; // higher default for snappier experience
-const DEFAULT_QUALITY = clamp(parseInt(process.env.PUPPETEER_QUALITY) || 70, 10, 90);
-
-// Create a puppeteer session and navigate to URL
-app.post('/session', async (req, res) => {
-  const { url, fps } = req.body || {};
-  if (!url) return res.status(400).json({ error: 'Missing url in body' });
-  let targetUrl;
-  try { targetUrl = new URL(url); } catch (e) { return res.status(400).json({ error: 'Invalid URL' }); }
-
-  try {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    // Set a reasonable viewport; client can request resize
-    await page.setViewport({ width: 1280, height: 720 });
-    await page.goto(targetUrl.toString(), { waitUntil: 'networkidle2', timeout: 45000 }).catch(e => {});
-
-    const sessionId = makeId();
-    const sessionFps = clamp(parseInt(fps) || DEFAULT_FPS, 1, 30);
-    sessions.set(sessionId, { page, interval: null, lastActive: Date.now(), ws: null, fps: sessionFps, quality: DEFAULT_QUALITY });
-
-    // Close session after inactivity (5 minutes)
-    setTimeout(() => {
-      const s = sessions.get(sessionId);
-      if (s && Date.now() - s.lastActive > 5 * 60 * 1000) {
-        try { s.page.close(); } catch(e){}
-        sessions.delete(sessionId);
-      }
-    }, 6 * 60 * 1000);
-
-    res.json({ sessionId, fps: sessionFps });
-  } catch (err) {
-    console.error('session create err', err && err.message);
-    res.status(500).json({ error: 'Failed to create session', details: err && err.message });
-  }
-});
-
-// Upgrade HTTP to WebSocket for ws connections
-server.on('upgrade', (request, socket, head) => {
-  const url = new URL(request.url, `http://${request.headers.host}`);
-  if (url.pathname === '/ws') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
-  } else {
-    socket.destroy();
-  }
-});
-
-// Handle incoming WS connections: expect query ?sessionId=<id>
-wss.on('connection', async (ws, request) => {
-  const params = new URL(request.url, `http://${request.headers.host}`).searchParams;
-  const sessionId = params.get('sessionId');
-  if (!sessionId || !sessions.has(sessionId)) {
-    ws.send(JSON.stringify({ type: 'error', msg: 'Invalid or missing sessionId' }));
-    ws.close();
-    return;
-  }
-  const s = sessions.get(sessionId);
-  s.ws = ws;
-  s.lastActive = Date.now();
-
-  // Start screenshot loop using session-specific fps
-  const fps = clamp(s.fps || DEFAULT_FPS, 1, 30);
-  const intervalMs = Math.max(Math.round(1000 / fps), 50); // cap at minimum 50ms interval
-  const quality = clamp(s.quality || DEFAULT_QUALITY, 10, 90);
-
-  s.interval = setInterval(async () => {
-    try {
-      const buf = await s.page.screenshot({ type: 'jpeg', quality: quality, fullPage: false });
-      if (ws.readyState === WebSocket.OPEN) ws.send(buf);
-    } catch (e) {
-      // ignore screenshot errors
-    }
-  }, intervalMs);
-
-  ws.on('message', async (data) => {
-    s.lastActive = Date.now();
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch (e) { return; }
-    try {
-      if (msg.type === 'mouse') {
-        const { x, y, action, button = 'left' } = msg;
-        if (action === 'move') await s.page.mouse.move(x, y);
-        else if (action === 'down') await s.page.mouse.down({ button });
-        else if (action === 'up') await s.page.mouse.up({ button });
-        else if (action === 'click') await s.page.mouse.click(x, y, { button });
-      } else if (msg.type === 'wheel') {
-        const { deltaX = 0, deltaY = 0 } = msg;
-        await s.page.mouse.wheel({ deltaX, deltaY });
-      } else if (msg.type === 'keyboard') {
-        const { action, text, key } = msg;
-        if (action === 'type' && text) await s.page.keyboard.type(text);
-        else if (action === 'down' && key) await s.page.keyboard.down(key);
-        else if (action === 'up' && key) await s.page.keyboard.up(key);
-        else if (action === 'press' && key) await s.page.keyboard.press(key);
-      } else if (msg.type === 'resize') {
-        const { width, height } = msg;
-        await s.page.setViewport({ width: Math.max(100, width), height: Math.max(100, height) });
-      }
-    } catch (e) {
-      // ignore
-    }
-  });
-
-  ws.on('close', async () => {
-    clearInterval(s.interval);
-    try { await s.page.close(); } catch(e){}
-    sessions.delete(sessionId);
-  });
-});
-
-// --- Proxy endpoint (unchanged behavior but keeps streaming and header forwarding) ---
 app.get('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send('Missing url param');
@@ -180,6 +71,9 @@ app.get('/proxy', async (req, res) => {
     return res.status(400).send('Invalid URL');
   }
 
+  if (!isHostAllowed(targetUrl.hostname)) return res.status(403).send('Host not allowed');
+
+  // Build upstream headers from selected incoming headers
   const upstreamHeaders = {};
   FORWARD_REQ_HEADERS.forEach(h => {
     if (req.headers[h]) upstreamHeaders[h] = req.headers[h];
@@ -196,6 +90,7 @@ app.get('/proxy', async (req, res) => {
     const upstreamContentType = (upstream.headers['content-type'] || '').toLowerCase();
 
     if (upstreamContentType.includes('text/html')) {
+      // Collect the stream then parse & rewrite HTML
       const chunks = [];
       await new Promise((resolve, reject) => {
         upstream.data.on('data', c => chunks.push(c));
@@ -229,6 +124,7 @@ app.get('/proxy', async (req, res) => {
         });
       });
 
+      // srcset handling
       $('[srcset]').each((i, el) => {
         const raw = $(el).attr('srcset');
         const parts = raw.split(',').map(p => p.trim()).map(item => {
@@ -240,6 +136,7 @@ app.get('/proxy', async (req, res) => {
         $(el).attr('srcset', parts.join(', '));
       });
 
+      // meta refresh
       $('meta[http-equiv]').each((i, el) => {
         const he = ($(el).attr('http-equiv') || '').toLowerCase();
         if (he === 'refresh') {
@@ -254,12 +151,15 @@ app.get('/proxy', async (req, res) => {
         }
       });
 
+      // remove base so rewrites work
       $('base').remove();
 
-      const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    try{ if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input); } catch(e){}\n    return _fetch.call(this, input, init);\n  };\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n  if (navigator && navigator.serviceWorker) {\n    navigator.serviceWorker.register = function(){ return Promise.resolve(); };\n  }\n  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}\n})();\n</script>\n      `;
+      // inject client helper to proxy fetch/XHR and noop serviceWorker
+      const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    try{ if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input); } catch(e){}\n    return _fetch.call(this, input, init);\n  };\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n  if (navigator && navigator.serviceWorker) { navigator.serviceWorker.register = function(){ return Promise.resolve(); }; }\n  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}\n})();\n</script>\n      `;
 
       $('body').append(injectedScript);
 
+      // Copy headers but filter hop-by-hop; overwrite frame/CSP headers
       const respHeaders = Object.assign({}, upstream.headers);
       Object.keys(respHeaders).forEach(h => {
         if (HOP_BY_HOP.has(h.toLowerCase())) delete respHeaders[h];
@@ -276,16 +176,13 @@ app.get('/proxy', async (req, res) => {
       return res.send($.html());
     }
 
+    // Non-HTML: stream back and copy key headers (support Range)
     const toCopy = ['content-type','content-length','content-range','accept-ranges','cache-control','expires','last-modified','etag','set-cookie'];
-    toCopy.forEach(h => {
-      if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
-    });
+    toCopy.forEach(h => { if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]); });
 
     res.setHeader('x-frame-options', 'ALLOWALL');
     res.setHeader('content-security-policy', "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;");
-
     res.status(upstream.status);
-
     upstream.data.pipe(res);
 
   } catch (err) {
@@ -294,14 +191,6 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// Serve a simple page for joining a session (optional)
-app.get('/session/:id', (req, res) => {
-  const id = req.params.id;
-  if (!sessions.has(id)) return res.status(404).send('Session not found');
-  // redirect to the frontend page which can connect via WS
-  res.redirect('/');
-});
-
-server.listen(PORT, () => {
-  console.log(`site-proxy listening on http://localhost:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`site-proxy (lightweight) listening on http://localhost:${PORT}`);
 });
