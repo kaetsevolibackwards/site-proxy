@@ -8,18 +8,57 @@
   </head>
   <body>
     <h3>Site Proxy (lightweight)</h3>
-    <p>Enter a URL and click "Load via HTTP proxy". This lightweight proxy rewrites HTML and streams assets. It is development-only — do not expose publicly without authentication.</p>
+    <p>Enter a URL and choose how to open it. For sites that block embedding (Google, some banks), use "Open proxied page in new tab" so the site loads as a top-level page through the proxy (this bypasses frame-blocking). You can also open via the integrated <strong>tProxy</strong> implementation by clicking "Open with tProxy" which uses the tProxy handler and its URL encoding.</p>
     <div>
       <input id="url" placeholder="https://example.com" size="60" />
-      <button id="loadProxy">Load via HTTP proxy</button>
+      <button id="openNew">Open proxied page in new tab</button>
+      <button id="loadProxy">Load in iframe (may be blocked)</button>
+      <button id="openTProxy">Open with tProxy</button>
+    </div>
+    <div style="margin-top:8px">
+      <small>Tip: you can also copy the proxied link: <code id="link"></code></small>
     </div>
     <iframe id="frame"></iframe>
 
     <script>
-      document.getElementById('loadProxy').addEventListener('click', () => {
-        const u = document.getElementById('url').value.trim();
-        if (!u) return;
-        document.getElementById('frame').src = '/proxy?url=' + encodeURIComponent(u);
+      const openNewBtn = document.getElementById('openNew');
+      const loadProxyBtn = document.getElementById('loadProxy');
+      const openTProxyBtn = document.getElementById('openTProxy');
+      const urlInput = document.getElementById('url');
+      const frame = document.getElementById('frame');
+      const linkEl = document.getElementById('link');
+
+      function proxied(url){
+        try{ return '/proxy?url=' + encodeURIComponent((new URL(url)).toString()); }
+        catch(e){ return '/proxy?url=' + encodeURIComponent(url); }
+      }
+
+      function tproxied(url){
+        try{ return '/prox?url=' + btoa((new URL(url)).toString()); }
+        catch(e){ return '/prox?url=' + btoa(url); }
+      }
+
+      openNewBtn.addEventListener('click', () => {
+        const u = urlInput.value.trim();
+        if (!u) return alert('Enter a URL');
+        const p = proxied(u);
+        window.open(p, '_blank', 'noopener');
+        linkEl.textContent = window.location.origin + p;
+      });
+
+      loadProxyBtn.addEventListener('click', () => {
+        const u = urlInput.value.trim();
+        if (!u) return alert('Enter a URL');
+        frame.src = proxied(u);
+        linkEl.textContent = window.location.origin + proxied(u);
+      });
+
+      openTProxyBtn.addEventListener('click', () => {
+        const u = urlInput.value.trim();
+        if (!u) return alert('Enter a URL');
+        const p = tproxied(u);
+        window.open(p, '_blank', 'noopener');
+        linkEl.textContent = window.location.origin + p;
       });
     </script>
   </body>

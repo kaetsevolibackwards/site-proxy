@@ -1,8 +1,9 @@
 // name=server.js
 // Lightweight site proxy using http-proxy for efficient streaming and cheerio for HTML rewrites.
-// Buffers HTML up to a configured limit and rewrites resource URLs to route through /proxy.
+// Now integrated with tProxy adapter (SevenworksDev/stop-using-this) to provide an alternate proxy handler.
 
 const express = require('express');
+const http = require('http');
 const httpProxy = require('http-proxy');
 const cheerio = require('cheerio');
 const { URL } = require('url');
@@ -20,6 +21,7 @@ const PORT = process.env.PORT || 3000;
 const MAX_HTML_BYTES = parseInt(process.env.MAX_HTML_BYTES || String(2 * 1024 * 1024), 10); // 2MB default
 
 app.use(express.static('public'));
+app.use(express.json());
 
 // Basic auth (optional)
 function basicAuth(req, res, next) {
@@ -38,6 +40,10 @@ function basicAuth(req, res, next) {
   return res.status(401).send('Authentication required');
 }
 app.use(basicAuth);
+
+// tProxy adapter
+const tproxyAdapter = require('./tproxy-adapter');
+app.use(tproxyAdapter.middleware);
 
 function isHostAllowed(hostname) {
   const list = (process.env.ALLOWED_HOSTS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -261,6 +267,10 @@ app.get('/proxy', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`site-proxy (http-proxy) listening on http://localhost:${PORT}`);
+// create http server and attach websocket support for tProxy
+const server = http.createServer(app);
+try { tproxyAdapter.attachWs(server); } catch (e) { console.error('tproxy attachWs failed', e && e.message); }
+
+server.listen(PORT, () => {
+  console.log(`site-proxy (http-proxy + tproxy) listening on http://localhost:${PORT}`);
 });
