@@ -16,6 +16,7 @@
     <div id="controls">
       <input id="url" placeholder="https://example.com or https://youtube.com" size="60" />
       <button id="loadProxy">Load via HTTP proxy</button>
+      <label style="margin-left:8px">FPS: <input id="fps" type="number" value="12" min="1" max="30" style="width:60px"/></label>
       <button id="startSession">Start Puppeteer session</button>
       <button id="stopSession" disabled>Stop Session</button>
     </div>
@@ -33,6 +34,7 @@
       const startBtn = document.getElementById('startSession');
       const stopBtn = document.getElementById('stopSession');
       const urlInput = document.getElementById('url');
+      const fpsInput = document.getElementById('fps');
       const frame = document.getElementById('frame');
       const canvas = document.getElementById('canvas');
       const ctx = canvas.getContext('2d');
@@ -49,10 +51,11 @@
       startBtn.addEventListener('click', async () => {
         const url = urlInput.value.trim();
         if (!url) return alert('Enter a URL');
+        const fps = parseInt(fpsInput.value) || 12;
         // create a session
-        const resp = await fetch('/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
+        const resp = await fetch('/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url, fps }) });
         const j = await resp.json();
-        if (j.error) return alert('Failed: ' + j.error);
+        if (j.error) return alert('Failed: ' + j.error + (j.details ? '\n' + j.details : ''));
         sessionId = j.sessionId;
         startWS(sessionId);
         startBtn.disabled = true;
@@ -78,11 +81,9 @@
             try { const msg = JSON.parse(ev.data); console.log('ws msg', msg); } catch(e){}
             return;
           }
-          // binary frame: jpeg image
           const blob = new Blob([ev.data], { type: 'image/jpeg' });
           const img = new Image();
           img.onload = () => {
-            // resize canvas if needed
             if (canvas.width !== img.width || canvas.height !== img.height) {
               canvas.width = img.width; canvas.height = img.height;
             }
@@ -93,7 +94,6 @@
         };
         ws.onclose = () => console.log('ws closed');
 
-        // forward mouse events
         canvas.addEventListener('mousemove', (e) => {
           const rect = canvas.getBoundingClientRect();
           const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
@@ -123,7 +123,6 @@
         });
         window.addEventListener('keydown', (e) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          // send key presses
           if (e.key.length === 1) {
             ws.send(JSON.stringify({ type: 'keyboard', action: 'type', text: e.key }));
           } else {

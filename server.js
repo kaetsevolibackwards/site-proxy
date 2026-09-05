@@ -43,7 +43,7 @@ const HOP_BY_HOP = new Set([
 ]);
 
 // --- Puppeteer session manager ---
-const sessions = new Map(); // sessionId -> {page, interval, lastActive}
+const sessions = new Map(); // sessionId -> {page, interval, lastActive, ws, fps}
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) browserPromise = puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
@@ -54,9 +54,14 @@ function makeId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
 }
 
+// Helper to clamp fps and quality
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+const DEFAULT_FPS = parseInt(process.env.PUPPETEER_FPS) || 12; // higher default for snappier experience
+const DEFAULT_QUALITY = clamp(parseInt(process.env.PUPPETEER_QUALITY) || 70, 10, 90);
+
 // Create a puppeteer session and navigate to URL
 app.post('/session', async (req, res) => {
-  const { url } = req.body || {};
+  const { url, fps } = req.body || {};
   if (!url) return res.status(400).json({ error: 'Missing url in body' });
   let targetUrl;
   try { targetUrl = new URL(url); } catch (e) { return res.status(400).json({ error: 'Invalid URL' }); }
@@ -69,7 +74,8 @@ app.post('/session', async (req, res) => {
     await page.goto(targetUrl.toString(), { waitUntil: 'networkidle2', timeout: 45000 }).catch(e => {});
 
     const sessionId = makeId();
-    sessions.set(sessionId, { page, interval: null, lastActive: Date.now(), ws: null });
+    const sessionFps = clamp(parseInt(fps) || DEFAULT_FPS, 1, 30);
+    sessions.set(sessionId, { page, interval: null, lastActive: Date.now(), ws: null, fps: sessionFps, quality: DEFAULT_QUALITY });
 
     // Close session after inactivity (5 minutes)
     setTimeout(() => {
@@ -80,10 +86,10 @@ app.post('/session', async (req, res) => {
       }
     }, 6 * 60 * 1000);
 
-    res.json({ sessionId });
+    res.json({ sessionId, fps: sessionFps });
   } catch (err) {
     console.error('session create err', err && err.message);
-    res.status(500).json({ error: 'Failed to create session' });
+    res.status(500).json({ error: 'Failed to create session', details: err && err.message });
   }
 });
 
@@ -112,13 +118,14 @@ wss.on('connection', async (ws, request) => {
   s.ws = ws;
   s.lastActive = Date.now();
 
-  // Start screenshot loop (e.g., 4 fps)
-  const fps = 4;
-  const intervalMs = Math.max(1000 / fps, 100);
+  // Start screenshot loop using session-specific fps
+  const fps = clamp(s.fps || DEFAULT_FPS, 1, 30);
+  const intervalMs = Math.max(Math.round(1000 / fps), 50); // cap at minimum 50ms interval
+  const quality = clamp(s.quality || DEFAULT_QUALITY, 10, 90);
+
   s.interval = setInterval(async () => {
     try {
-      const buf = await s.page.screenshot({ type: 'jpeg', quality: 60, fullPage: false });
-      // send binary frame
+      const buf = await s.page.screenshot({ type: 'jpeg', quality: quality, fullPage: false });
       if (ws.readyState === WebSocket.OPEN) ws.send(buf);
     } catch (e) {
       // ignore screenshot errors
@@ -127,7 +134,6 @@ wss.on('connection', async (ws, request) => {
 
   ws.on('message', async (data) => {
     s.lastActive = Date.now();
-    // Expect JSON messages for events; binary frames not used from client
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (e) { return; }
     try {
@@ -156,7 +162,6 @@ wss.on('connection', async (ws, request) => {
   });
 
   ws.on('close', async () => {
-    // stop interval and close page
     clearInterval(s.interval);
     try { await s.page.close(); } catch(e){}
     sessions.delete(sessionId);
