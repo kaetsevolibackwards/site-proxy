@@ -6,6 +6,12 @@ const express = require('express');
 const httpProxy = require('http-proxy');
 const cheerio = require('cheerio');
 const { URL } = require('url');
+const zlib = require('zlib');
+const { promisify } = require('util');
+
+const gunzip = promisify(zlib.gunzip);
+const brotliDecompress = promisify(zlib.brotliDecompress);
+const inflate = promisify(zlib.inflate);
 
 const app = express();
 const proxy = httpProxy.createProxyServer({});
@@ -70,6 +76,26 @@ proxy.on('proxyReq', function(proxyReq, req, res, options) {
   });
 });
 
+async function tryDecompress(buffer, encoding) {
+  if (!encoding) return buffer;
+  const enc = encoding.toLowerCase();
+  try {
+    if (enc.includes('br')) {
+      return await brotliDecompress(buffer);
+    }
+    if (enc.includes('gzip')) {
+      return await gunzip(buffer);
+    }
+    if (enc.includes('deflate')) {
+      return await inflate(buffer);
+    }
+  } catch (e) {
+    // decompression failed
+    return null;
+  }
+  return null;
+}
+
 // Main proxy handler: uses selfHandleResponse so we can intercept HTML responses
 app.get('/proxy', (req, res) => {
   const target = req.query.url;
@@ -96,6 +122,7 @@ app.get('/proxy', (req, res) => {
     respHeaders['content-security-policy'] = "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;";
 
     const contentType = (proxyRes.headers['content-type'] || '').toLowerCase();
+    const contentEncoding = proxyRes.headers['content-encoding'];
 
     if (contentType.includes('text/html')) {
       // Buffer HTML up to MAX_HTML_BYTES and rewrite; if exceeded, stream raw upstream response
@@ -111,16 +138,31 @@ app.get('/proxy', (req, res) => {
           aborted = true;
           // send headers and pipe remaining data directly
           try { res2.writeHead(proxyRes.statusCode, respHeaders); } catch (e) {}
-          // write what we buffered so far
           try { res2.write(Buffer.concat(buffers)); } catch (e) {}
-          // pipe the rest of upstream response directly
           proxyRes.pipe(res2);
         }
       });
 
-      proxyRes.on('end', () => {
+      proxyRes.on('end', async () => {
         if (aborted) return; // already piped
-        const html = Buffer.concat(buffers).toString('utf8');
+        const rawBuf = Buffer.concat(buffers);
+        // Try to decompress if needed
+        let decompressed = rawBuf;
+        if (contentEncoding) {
+          const d = await tryDecompress(rawBuf, contentEncoding);
+          if (d) {
+            decompressed = d;
+            // remove content-encoding and content-length headers because we're sending decompressed HTML
+            delete respHeaders['content-encoding'];
+            delete respHeaders['content-length'];
+          } else {
+            // decompression failed - fallback to streaming raw compressed content
+            try { res2.writeHead(proxyRes.statusCode, respHeaders); } catch (e) {}
+            return res2.end(rawBuf);
+          }
+        }
+
+        const html = decompressed.toString('utf8');
         try {
           const $ = cheerio.load(html, { decodeEntities: false });
           const base = targetUrl;
@@ -174,17 +216,19 @@ app.get('/proxy', (req, res) => {
 
           $('base').remove();
 
-          const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    try{ if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input); } catch(e){}\n    return _fetch.call(this, input, init);\n  };\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n  if (navigator && navigator.serviceWorker) { navigator.serviceWorker.register = function(){ return Promise.resolve(); }; }\n  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}\n})();\n</script>\n          `;
+          const injectedScript = `\n<script>\n(function(){\n  const origin = ${JSON.stringify(base.origin)};\n  function toProxy(u){\n    try{ const full = new URL(u, origin).toString(); return '/proxy?url='+encodeURIComponent(full); } catch(e){ return u; }\n  }\n  const _fetch = window.fetch;\n  window.fetch = function(input, init){\n    try{ if (typeof input === 'string') input = toProxy(input);\n    else if (input && input.url) input = new Request(toProxy(input.url), input); } catch(e){}\n    return _fetch.call(this, input, init);\n  };\n  const XHROpen = XMLHttpRequest.prototype.open;\n  XMLHttpRequest.prototype.open = function(method, url) {\n    try { url = toProxy(url); } catch(e) {}\n    return XHROpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments,2)));\n  };\n  if (navigator && navigator.serviceWorker) { navigator.serviceWorker.register = function(){ return Promise.resolve(); }; }\n  try { Object.defineProperty(navigator, 'onLine', { get: function(){ return true; }, configurable: true }); } catch(e){}\n})();\n</script>\n`;
 
           $('body').append(injectedScript);
 
           const out = $.html();
+          // remove content-length if present (we're sending new body)
+          delete respHeaders['content-length'];
           try { res2.writeHead(proxyRes.statusCode, respHeaders); } catch (e) {}
           return res2.end(out);
         } catch (err) {
           console.error('html rewrite error', err && err.message);
           try { res2.writeHead(proxyRes.statusCode, respHeaders); } catch (e) {}
-          return res2.end(Buffer.concat(buffers));
+          return res2.end(decompressed);
         }
       });
 
@@ -198,7 +242,7 @@ app.get('/proxy', (req, res) => {
 
     } else {
       // Non-HTML: stream directly, copying a subset of headers
-      const toCopy = ['content-type','content-length','content-range','accept-ranges','cache-control','expires','last-modified','etag','set-cookie'];
+      const toCopy = ['content-type','content-length','content-range','accept-ranges','cache-control','expires','last-modified','etag','set-cookie','content-encoding'];
       const outHeaders = {};
       toCopy.forEach(h => { if (proxyRes.headers[h]) outHeaders[h] = proxyRes.headers[h]; });
       // ensure framing/CSP relaxed
